@@ -124,7 +124,7 @@
   .filter-reset:hover{color:var(--red);border-color:var(--red);}
   .filter-reset.active{color:var(--red);border-color:var(--red);}
 
-  .page{display:none;padding:26px 28px 60px;max-width:1320px;margin:0 auto;width:100%;}
+  .page{display:none;padding:26px 16px 60px;width:100%;}
   .page.active{display:block;}
 
   .page-head{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:20px;}
@@ -483,6 +483,12 @@ function computeRows(raw, mode, key){
         const statutRaw = String(pick(row,['Statut','STATUT'])).trim().toUpperCase();
         ok = statutRaw.startsWith('VALID') ? 1 : 0;
         nok = ok ? 0 : 1;
+      }else if(key === 'MAIL'){
+        // Mail : "dans les délais" = ticket reçu le jour J et dont le début de traitement
+        // a lieu ce même jour J (comparaison des dates calendaires, donc forcément < 24h).
+        const sameDay = reception && debut && dayKey(reception) === dayKey(debut);
+        ok = sameDay ? 1 : 0;
+        nok = sameDay ? 0 : 1;
       }else{
         const backlogRaw = String(pick(row,['BACKLOG'])).trim().toLowerCase();
         const isBacklog = backlogRaw === 'oui' || backlogRaw === 'yes' || backlogRaw === '1';
@@ -518,27 +524,19 @@ function computeRows(raw, mode, key){
   });
 }
 
-const BACKLOG_AGE_MS = 24 * 3600 * 1000; // ticket = backlog si son "début de traitement" date de plus de 24h
-
 function aggregate(rows, mode, groupField, key){
   groupField = groupField || 'types';
   const totalRecu = rows.reduce((a,r)=>a+r.recu,0);
   const totalOk = rows.reduce((a,r)=>a+r.ok,0);
   const totalNok = rows.reduce((a,r)=>a+r.nok,0);
-  // Backlog VDC = délai de prise en charge du ticket (Début Traitement − Réception S2, soit le DMPC
-  // déjà calculé par ligne, en heures) supérieur à 24h. On ne compare plus à "maintenant" : sur des
-  // données historiques, tout ticket ancien ressortait à tort en backlog. Pour les autres onglets,
-  // le backlog reste basé sur l'âge du "début de traitement" par rapport à maintenant.
-  const nowTs = Date.now();
-  const backlog = rows.reduce((sum,r)=>{
-    if(key === 'VDC'){
-      if(r.dmpc !== null && r.dmpc > 24){
-        return sum + (r.recu || 0);
-      }
-      return sum;
-    }
-    const backlogRef = r.debut;
-    if(backlogRef && (nowTs - backlogRef.getTime()) > BACKLOG_AGE_MS){
+  // Backlog = délai de prise en charge du ticket (Début Traitement − date de réception de référence
+  // — réception S2 pour RPI/ASP/VDC, réception standard sinon — soit le DMPC déjà calculé par ligne,
+  // en heures) supérieur à 24h. Aligné sur le calcul VDC : on ne compare plus à "maintenant", qui
+  // faussait le résultat sur des données historiques (tout ticket ancien ressortait à tort en backlog).
+  // Exception Mail : le backlog est le strict complément du "Taux dans les délais" (réception et début
+  // de traitement le même jour calendaire J), afin que les deux cartes totalisent toujours 100%.
+  const backlog = key === 'MAIL' ? totalNok : rows.reduce((sum,r)=>{
+    if(r.dmpc !== null && r.dmpc > 24){
       return sum + (r.recu || 0);
     }
     return sum;
@@ -861,7 +859,7 @@ function renderDashboard(key, rows, mode, totalCount){
   const labels = ticketLabels(key);
   agg.okLabel = isTicketMode ? labels.ok : 'Traité OK';
   agg.nokLabel = isTicketMode ? labels.nok : 'Traité NOK';
-  const backlogKpiCaption = key === 'VDC' ? 'en backlog (réception S2 depuis + de 24h)' : 'en backlog (démarrés depuis + de 24h)';
+  const backlogKpiCaption = (key === 'RPI' || key === 'ASP' || key === 'VDC') ? 'en backlog (réception S2 depuis + de 24h)' : key === 'MAIL' ? 'en backlog (non traités le jour de réception)' : 'en backlog (réception depuis + de 24h)';
   const tauxKpiCaption = isTicketMode ? labels.taux : 'Taux de traitement OK sur le total reçu';
 
   const tauxClass = agg.taux===null ? '' : agg.taux>=90 ? 'green' : agg.taux>=70 ? 'amber' : '';
@@ -905,13 +903,12 @@ function renderDashboard(key, rows, mode, totalCount){
       <div class="kpi"><div class="kpi-name">DMT</div><div class="val cyan">${fmtHours(agg.avgDmt)}</div><div class="label">DMT moyen — durée moyenne d'appel</div></div>
     </div>
     ` : `
-    <div class="kpi-row"${key === 'VDC' ? ' style="grid-template-columns:repeat(9,1fr);"' : ''}>
+    <div class="kpi-row"${key === 'VDC' ? ' style="grid-template-columns:repeat(8,1fr);"' : ''}>
       <div class="kpi"><div class="kpi-name">DMT</div><div class="val cyan">${fmtHours(agg.avgDmt)}</div><div class="label">DMT moyen — durée entre le début et la fin du traitement</div></div>
       <div class="kpi"><div class="kpi-name">DMPC</div><div class="val cyan">${fmtHours(agg.avgDmpc)}</div><div class="label">DMPC moyen — délai avant prise en charge après réception</div></div>
       <div class="kpi"><div class="kpi-name">DMPC globale</div><div class="val cyan">${fmtHours(agg.avgDmpcGlobale)}</div><div class="label">DMPC globale moyenne — de la réception à la clôture</div></div>
-      <div class="kpi"><div class="kpi-name">Backlog</div><div class="val ${backlogClass}">${agg.backlog.toLocaleString('fr-FR')}</div><div class="label">${agg.backlogTaux===null?'—':agg.backlogTaux.toFixed(1)+'%'} ${backlogKpiCaption}</div></div>
-      ${key === 'VDC' ? `<div class="kpi"><div class="kpi-name">Traités</div><div class="val">${totalTraite.toLocaleString('fr-FR')}</div><div class="label"><span style="color:var(--${tauxTraitesDansLesTempsClass||'text-dim'});font-weight:600;">${tauxTraitesDansLesTemps===null?'—':tauxTraitesDansLesTemps.toFixed(1)+'%'}</span> dans les temps (≤24h) <span style="font-family:'IBM Plex Mono',monospace;color:var(--text-dim);">(${traitesDansLesTemps.toLocaleString('fr-FR')})</span></div></div>` : ''}
-      <div class="kpi"><div class="kpi-name">Taux</div><div class="val ${tauxClass}">${agg.taux===null?'—':agg.taux.toFixed(1)+'%'}</div><div class="label">${tauxKpiCaption}</div></div>
+      <div class="kpi"><div class="kpi-name">BACKLOG TRAITES</div><div class="val ${backlogClass}">${agg.backlogTaux===null?'—':agg.backlogTaux.toFixed(1)+'%'}</div><div class="label">(${agg.backlog.toLocaleString('fr-FR')})</div></div>
+      <div class="kpi"><div class="kpi-name">${(key === 'MAIL' || key === 'FACEBOOK' || key === 'INDEXATION') ? 'TAUX < 24 HEURE' : 'Taux'}</div><div class="val ${tauxClass}">${agg.taux===null?'—':agg.taux.toFixed(1)+'%'}</div><div class="label">(${agg.totalOk.toLocaleString('fr-FR')}/${agg.totalRecu.toLocaleString('fr-FR')})</div></div>
       ${key === 'VDC' ? `<div class="kpi"><div class="kpi-name">DMPC &lt; 24h</div><div class="val ${tauxSous24hDmpcClass}">${tauxSous24hDmpc===null?'—':tauxSous24hDmpc.toFixed(1)+'%'}</div><div class="label">Traité avec une DMPC de moins de 24h <span style="font-family:'IBM Plex Mono',monospace;color:var(--text-dim);">(${sous24hDmpc.toLocaleString('fr-FR')}/${dmpcRenseigne.length.toLocaleString('fr-FR')})</span></div></div>` : ''}
       ${key === 'VDC' ? `<div class="kpi"><div class="kpi-name">Dimanche</div><div class="val ${tauxDimancheClass}">${tauxDimanche===null?'—':tauxDimanche.toFixed(1)+'%'}</div><div class="label">Reçus un dimanche <span style="font-family:'IBM Plex Mono',monospace;color:var(--text-dim);">(${recusDimanche.toLocaleString('fr-FR')}/${dmtRenseigne.length.toLocaleString('fr-FR')})</span></div></div>` : ''}
       ${key === 'VDC' ? `<div class="kpi"><div class="kpi-name">Samedi</div><div class="val ${tauxSamediClass}">${tauxSamedi===null?'—':tauxSamedi.toFixed(1)+'%'}</div><div class="label">Reçus un samedi <span style="font-family:'IBM Plex Mono',monospace;color:var(--text-dim);">(${recusSamedi.toLocaleString('fr-FR')}/${dmtRenseigne.length.toLocaleString('fr-FR')})</span></div></div>` : ''}
@@ -921,9 +918,17 @@ function renderDashboard(key, rows, mode, totalCount){
     ${QUICK_DMPC_PAGES[key] ? (()=>{
       const quick = renderQuickDmpcCards(rows, agg.totalRecu);
       const quickTauxTxt = quick.taux===null ? '' : ` · <span style="color:var(--cyan);font-weight:600;">${quick.taux.toFixed(1)}%</span> du traitement total`;
+      const titleLine = `⚡ Traitements avec DMPC &lt; 30 min <span style="color:var(--text-dim);font-weight:400;">(${quick.count}${quick.total?`/${quick.total.toLocaleString('fr-FR')}`:''})</span>${quickTauxTxt}`;
+      if(key === 'MAIL'){
+        // Page Mail : une seule carte de synthèse (taux + nombre), sans la grille des traitements individuels.
+        return `
+    <div class="panel" style="margin-bottom:20px;">
+      <h3 style="margin:0;">${titleLine}</h3>
+    </div>`;
+      }
       return `
     <div class="panel" style="margin-bottom:20px;">
-      <h3>⚡ Traitements avec DMPC &lt; 30 min <span style="color:var(--text-dim);font-weight:400;">(${quick.count}${quick.total?`/${quick.total.toLocaleString('fr-FR')}`:''})</span>${quickTauxTxt}</h3>
+      <h3>${titleLine}</h3>
       ${quick.html}
     </div>`;
     })() : ''}
