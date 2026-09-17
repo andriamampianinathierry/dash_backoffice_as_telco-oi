@@ -660,6 +660,139 @@ function renderRecapTable(rows, groupField, groupLabel, variant, tableId){
   return `<table${tableId ? ` id="${tableId}"` : ''}><thead><tr>${head}</tr></thead><tbody>${bodyRows.join('')}</tbody></table>`;
 }
 
+// ---------- résumé des réalisations par agent (remplace "Derniers tickets" sur Mail / Facebook / Indexation) ----------
+function computeAgentSummaryGroups(rows){
+  const groups = {};
+  rows.forEach(r=>{
+    const agentKey = r.agent || 'Non renseigné';
+    if(!groups[agentKey]) groups[agentKey] = {rows:[], recu:0, ok:0, nok:0, byType:{}};
+    const g = groups[agentKey];
+    g.rows.push(r);
+    g.recu += r.recu;
+    g.ok += r.ok;
+    g.nok += r.nok;
+    const t = r.types || 'Non renseigné';
+    if(!g.byType[t]) g.byType[t] = 0;
+    g.byType[t] += r.recu || 1;
+  });
+  return groups;
+}
+// Construit le contenu de la colonne "Nombre de tickets traités par activité" : une ligne par
+// activité/type (ex: TYPES pour Mail/Indexation, COMPTE pour Facebook), triée par volume décroissant.
+function formatActivityBreakdown(byType){
+  const entries = Object.keys(byType).sort((a,b)=>byType[b]-byType[a]);
+  if(!entries.length) return '—';
+  return entries.map(t=>`${escapeHtml(t)} : ${byType[t].toLocaleString('fr-FR')}`).join('<br>');
+}
+function renderAgentSummaryTable(rows, mode, tableId, key){
+  const withAgent = rows.filter(r=>r.agent);
+  if(!withAgent.length) return `<div class="empty-state">Aucun agent renseigné sur la période affichée.</div>`;
+  const groups = computeAgentSummaryGroups(withAgent);
+  const agentKeys = Object.keys(groups).sort((a,b)=>groups[b].recu - groups[a].recu);
+  const labels = ticketLabels(key);
+  const isTicketMode = mode === 'ticket';
+  const okLabel = isTicketMode ? labels.ok : 'Traité OK';
+  const nokLabel = isTicketMode ? labels.nok : 'Traité NOK';
+  const tauxLabel = isTicketMode ? labels.taux : 'Taux OK';
+
+  const buildRow = (label, g)=>{
+    const n = g.recu;
+    const taux = n ? (g.ok/n*100) : null;
+    const avgDmt = fmtHours(avg(g.rows.map(r=>r.dmt)));
+    const avgDmpc = fmtHours(avg(g.rows.map(r=>r.dmpc)));
+    const avgDmpcG = fmtHours(avg(g.rows.map(r=>r.dmpcGlobale)));
+    return `<td>${label}</td><td>${n.toLocaleString('fr-FR')}</td><td>${g.ok.toLocaleString('fr-FR')}</td><td>${g.nok.toLocaleString('fr-FR')}</td><td>${taux===null?'—':taux.toFixed(1)+'%'}</td><td>${avgDmt}</td><td>${avgDmpc}</td><td>${avgDmpcG}</td><td>${formatActivityBreakdown(g.byType)}</td>`;
+  };
+
+  const bodyRows = agentKeys.map(a=>`<tr>${buildRow(escapeHtml(a), groups[a])}</tr>`);
+
+  const totalGroup = {rows: withAgent, recu:0, ok:0, nok:0, byType:{}};
+  withAgent.forEach(r=>{
+    totalGroup.recu += r.recu;
+    totalGroup.ok += r.ok;
+    totalGroup.nok += r.nok;
+    const t = r.types || 'Non renseigné';
+    if(!totalGroup.byType[t]) totalGroup.byType[t] = 0;
+    totalGroup.byType[t] += r.recu || 1;
+  });
+  bodyRows.push(`<tr style="font-weight:600;color:var(--text);">${buildRow('Total', totalGroup)}</tr>`);
+
+  const head = `<th>Agent</th><th>Traités</th><th>${okLabel}</th><th>${nokLabel}</th><th>${tauxLabel}</th><th>DMT</th><th>DMPC</th><th>DMPC globale</th><th>Nombre de tickets traités par activité</th>`;
+
+  return `<table${tableId ? ` id="${tableId}"` : ''}><thead><tr>${head}</tr></thead><tbody>${bodyRows.join('')}</tbody></table>`;
+}
+
+// ---------- résumé des réalisations par agent (RPI OI / ASP OI) — remplace "Derniers appels" ----------
+function renderAgentSummaryTableCalls(rows, tableId){
+  const withAgent = rows.filter(r=>r.agent);
+  if(!withAgent.length) return `<div class="empty-state">Aucun agent renseigné sur la période affichée.</div>`;
+  const groups = {};
+  withAgent.forEach(r=>{
+    const a = r.agent;
+    if(!groups[a]) groups[a] = {rows:[], abouti:0, nonAbouti:0};
+    groups[a].rows.push(r);
+    if(r.isAbouti) groups[a].abouti++; else groups[a].nonAbouti++;
+  });
+  const agentKeys = Object.keys(groups).sort((a,b)=>groups[b].rows.length - groups[a].rows.length);
+
+  const buildRow = (label, g)=>{
+    const n = g.rows.length;
+    const taux = n ? (g.abouti/n*100) : null;
+    const avgDmt = fmtHours(avg(g.rows.map(r=>r.dmt)));
+    return `<td>${label}</td><td>${n.toLocaleString('fr-FR')}</td><td>${g.abouti.toLocaleString('fr-FR')}</td><td>${g.nonAbouti.toLocaleString('fr-FR')}</td><td>${taux===null?'—':taux.toFixed(1)+'%'}</td><td>${avgDmt}</td>`;
+  };
+
+  const bodyRows = agentKeys.map(a=>`<tr>${buildRow(escapeHtml(a), groups[a])}</tr>`);
+
+  const totalGroup = {rows: withAgent, abouti: withAgent.filter(r=>r.isAbouti).length, nonAbouti: withAgent.filter(r=>!r.isAbouti).length};
+  bodyRows.push(`<tr style="font-weight:600;color:var(--text);">${buildRow('Total', totalGroup)}</tr>`);
+
+  const head = `<th>Agent</th><th>Nbr traité</th><th>Abouti</th><th>Non abouti</th><th>Taux abouti</th><th>DMT</th>`;
+  return `<table${tableId ? ` id="${tableId}"` : ''}><thead><tr>${head}</tr></thead><tbody>${bodyRows.join('')}</tbody></table>`;
+}
+
+// ---------- résumé des réalisations par agent (VDC) — nouveau tableau, en plus du détail par ticket ----------
+function renderAgentSummaryTableVDC(rows, tableId){
+  const withAgent = rows.filter(r=>r.agent);
+  if(!withAgent.length) return `<div class="empty-state">Aucun agent renseigné sur la période affichée.</div>`;
+  const groups = {};
+  withAgent.forEach(r=>{
+    const a = r.agent;
+    if(!groups[a]) groups[a] = {rows:[], ok:0, dmpcUnder24:0, dmpcN:0};
+    const g = groups[a];
+    g.rows.push(r);
+    g.ok += r.ok;
+    if(r.dmpc !== null){
+      g.dmpcN++;
+      if(r.dmpc < 24) g.dmpcUnder24++;
+    }
+  });
+  const agentKeys = Object.keys(groups).sort((a,b)=>groups[b].rows.length - groups[a].rows.length);
+
+  const buildRow = (label, g)=>{
+    const n = g.rows.length;
+    const avgDmt = fmtHours(avg(g.rows.map(r=>r.dmt)));
+    const avgDmpc = fmtHours(avg(g.rows.map(r=>r.dmpc)));
+    const dmpc24Taux = g.dmpcN ? (g.dmpcUnder24/g.dmpcN*100) : null;
+    const tauxValide = n ? (g.ok/n*100) : null;
+    return `<td>${label}</td><td>${n.toLocaleString('fr-FR')}</td><td>${avgDmt}</td><td>${avgDmpc}</td><td>${dmpc24Taux===null?'—':dmpc24Taux.toFixed(1)+'%'}</td><td>${tauxValide===null?'—':tauxValide.toFixed(1)+'%'}</td>`;
+  };
+
+  const bodyRows = agentKeys.map(a=>`<tr>${buildRow(escapeHtml(a), groups[a])}</tr>`);
+
+  const totalGroup = {rows: withAgent, ok: withAgent.reduce((s,r)=>s+r.ok,0), dmpcUnder24:0, dmpcN:0};
+  withAgent.forEach(r=>{
+    if(r.dmpc !== null){
+      totalGroup.dmpcN++;
+      if(r.dmpc < 24) totalGroup.dmpcUnder24++;
+    }
+  });
+  bodyRows.push(`<tr style="font-weight:600;color:var(--text);">${buildRow('Total', totalGroup)}</tr>`);
+
+  const head = `<th>Agent</th><th>Nbr traité</th><th>DMT</th><th>DMPC</th><th>DMPC &lt; 24h</th><th>Taux validé</th>`;
+  return `<table${tableId ? ` id="${tableId}"` : ''}><thead><tr>${head}</tr></thead><tbody>${bodyRows.join('')}</tbody></table>`;
+}
+
 // ---------- "Top 5 motifs de rejet" (VDC) ----------
 // Normalise un motif pour le regroupement : espaces multiples réduits, point(s) final(aux) retiré(s),
 // comparaison insensible à la casse — afin que "Justdom manquant", "Justdom manquant." ou
@@ -1008,6 +1141,15 @@ function renderDashboard(key, rows, mode, totalCount){
     </div>
 
     ${key === 'VDC' ? `
+    <div class="panel" style="margin-bottom:20px;overflow-x:auto;">
+      <div class="panel-head">
+        <h3>Résumé des réalisations des agents</h3>
+        <button class="dl-btn" type="button" onclick="downloadTableCSV('table-agents-${key}','${cfg.label.toLowerCase()}_resume_agents.csv')">${downloadIconSvg} Télécharger</button>
+      </div>
+      <div class="table-scroll">
+        ${renderAgentSummaryTableVDC(rows, `table-agents-${key}`)}
+      </div>
+    </div>
     <div class="panel">
       <div class="panel-head">
         <h3>Détail par ticket — ID Activité / Motif / Boutique</h3>
@@ -1017,13 +1159,25 @@ function renderDashboard(key, rows, mode, totalCount){
         ${renderMotifsParTicketTable(rows, `table-motifs-ticket-${key}`)}
       </div>
     </div>
-    ` : `
-    <div class="panel">
+    ` : (key === 'RPI' || key === 'ASP') ? `
+    <div class="panel" style="overflow-x:auto;">
       <div class="panel-head">
-        <h3>${(key === 'RPI' || key === 'ASP') ? 'Derniers appels' : 'Derniers tickets'}</h3>
-        <button class="dl-btn" type="button" onclick="downloadTableCSV('table-tickets-${key}','${cfg.label.toLowerCase()}_${(key === 'RPI' || key === 'ASP') ? 'derniers_appels' : 'derniers_tickets'}.csv')">${downloadIconSvg} Télécharger</button>
+        <h3>Résumé des réalisations des agents</h3>
+        <button class="dl-btn" type="button" onclick="downloadTableCSV('table-tickets-${key}','${cfg.label.toLowerCase()}_resume_agents.csv')">${downloadIconSvg} Télécharger</button>
       </div>
-      ${renderTable(rows, mode, `table-tickets-${key}`, key)}
+      <div class="table-scroll">
+        ${renderAgentSummaryTableCalls(rows, `table-tickets-${key}`)}
+      </div>
+    </div>
+    ` : `
+    <div class="panel" style="overflow-x:auto;">
+      <div class="panel-head">
+        <h3>Résumé des réalisations des agents</h3>
+        <button class="dl-btn" type="button" onclick="downloadTableCSV('table-tickets-${key}','${cfg.label.toLowerCase()}_resume_agents.csv')">${downloadIconSvg} Télécharger</button>
+      </div>
+      <div class="table-scroll">
+        ${renderAgentSummaryTable(rows, mode, `table-tickets-${key}`, key)}
+      </div>
     </div>
     `}
   `;
