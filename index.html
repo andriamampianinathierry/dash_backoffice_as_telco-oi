@@ -87,6 +87,7 @@
   .tab-btn.tab-rpi.active{color:var(--garnet);border-bottom-color:var(--garnet);}
   .tab-btn.tab-vdc.active{color:var(--green);border-bottom-color:var(--green);}
   .tab-btn.tab-asp.active{color:var(--purple);border-bottom-color:var(--purple);}
+  .tab-btn.tab-encaissement.active{color:var(--amber);border-bottom-color:var(--amber);}
 
   /* Filter bar */
   .filterbar{
@@ -269,6 +270,7 @@
       <button class="tab-btn tab-rpi" data-page="RPI">RPI OI</button>
       <button class="tab-btn tab-asp" data-page="ASP">ASP OI</button>
       <button class="tab-btn tab-vdc" data-page="VDC">VDC</button>
+      <button class="tab-btn tab-encaissement" data-page="ENCAISSEMENT">Encaissement</button>
     </div>
   </div>
 
@@ -278,6 +280,7 @@
   <div id="page-RPI" class="page"></div>
   <div id="page-ASP" class="page"></div>
   <div id="page-VDC" class="page"></div>
+  <div id="page-ENCAISSEMENT" class="page"></div>
 
 </div>
 
@@ -317,6 +320,12 @@ const CONFIG = {
     // Colonnes réelles : Agent / ID Activité / Boutique / Type / Zone / Statut / Motif Rejet /
     // Réception S2 / Début Traitement / Fin Traitement / DMT / Date enregistrement / DMPC
     url: "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ666bJapHYwTRLkpaJ5CmJJjROgL4KVE64r_QuZHFYSIUqJyMNuNgQwdP-t8gbiMNTYfIPuvX3dtgm/pub?gid=699607282&single=true&output=csv"
+  },
+  ENCAISSEMENT: {
+    label: "Encaissement",
+    // onglet "encaissements" — publié séparément sur le web (même document que RPI/ASP/VDC, gid 1330313910)
+    // Colonnes réelles : DATE / NOM ET PRENOM DU CLIENT / NUMERO / MOTIF / ZONE / MONTANT / AGENT / MOIS
+    url: "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ666bJapHYwTRLkpaJ5CmJJjROgL4KVE64r_QuZHFYSIUqJyMNuNgQwdP-t8gbiMNTYfIPuvX3dtgm/pub?gid=1330313910&single=true&output=csv"
   }
 };
 
@@ -455,6 +464,7 @@ function detectMode(raw){
 // ID Activité / Contact / Montant / Zone / Paiement / Mode de Règlement / Etat d'appels /
 // Statuts / Commentaires / Fin Traitement / DMT (ms) / DMPC / Agent
 function computeRows(raw, mode, key){
+  if(key === 'ENCAISSEMENT') return computeEncaissementRows(raw);
   const isRPI = key === 'RPI' || key === 'ASP';
   const isVDC = key === 'VDC';
   return raw.map(row=>{
@@ -979,6 +989,7 @@ function ticketLabels(key){
 }
 
 function renderDashboard(key, rows, mode, totalCount){
+  if(key === 'ENCAISSEMENT') return renderEncaissement(key, rows, totalCount);
   const cfg = CONFIG[key];
   const typeChartCfg = TYPE_CHART_CONFIG[key];
   const agg = aggregate(rows, mode, typeChartCfg.field, key);
@@ -1195,6 +1206,253 @@ function renderDashboard(key, rows, mode, totalCount){
     if(key === 'RPI' || key === 'ASP'){
       try{ renderAppelsChart(key, agg); }catch(e){ console.error('appels chart', e); }
     }
+  });
+}
+
+// ---------- ENCAISSEMENT ----------
+// Onglet "encaissements" : une ligne = un encaissement (DATE / NOM ET PRENOM DU CLIENT / NUMERO / MOTIF / ZONE / MONTANT / AGENT / MOIS).
+// Les montants utilisent la virgule décimale ("179,95") — toNum() la gère.
+// Un MONTANT supérieur à ENC_MAX_MONTANT est considéré comme une saisie aberrante (ex : numéro de téléphone collé
+// dans la colonne par erreur) : la ligne reste comptée mais son montant est exclu des totaux, et elle est listée en bas de page.
+const ENC_MAX_MONTANT = 1000;
+
+function fmtEuro(n){
+  if(n === null || n === undefined || isNaN(n)) return '—';
+  return n.toLocaleString('fr-FR', {minimumFractionDigits:2, maximumFractionDigits:2}) + ' €';
+}
+
+function computeEncaissementRows(raw){
+  return raw.map(row=>{
+    const dt = parseFRDate(pick(row,['DATE','Date']));
+    const montantBrut = toNum(pick(row,['MONTANT','Montant']));
+    const anomalie = montantBrut > ENC_MAX_MONTANT || montantBrut < 0;
+    const montant = anomalie ? 0 : montantBrut;
+    const motif = String(pick(row,['MOTIF','Motif'])).trim() || 'Non renseigné';
+    const zone = String(pick(row,['ZONE','Zone'])).trim() || 'Non renseigné';
+    const agent = String(pick(row,['AGENT','Agent'])).trim();
+    const client = String(pick(row,['NOM ET PRENOM DU CLIENT','Nom et prénom du client','Client'])).trim();
+    const numero = String(pick(row,['NUMERO','Numéro','Numero'])).trim();
+    // Champs communs attendus par les filtres globaux (mois / semaines / date / agent / zone)
+    return {
+      reception:dt, receptionS2:null, receptionDisplay:dt, debut:dt, fin:null,
+      recu:1, ok:1, nok:0, types:motif, zone, agent, compte:zone, zoneCompte:zone,
+      etatAppel:'', statutDetail:'', motifRejet:'', idActivite:'', isAbouti:false,
+      dmt:null, dmpc:null, dmpcGlobale:null,
+      montant, montantBrut, anomalie, motif, client, numero
+    };
+  }).filter(r=>r.debut); // ignore les lignes sans date exploitable (lignes vides en bas de feuille)
+}
+
+function encStats(rows){
+  const valid = rows.filter(r=>!r.anomalie);
+  const total = valid.reduce((a,r)=>a+r.montant, 0);
+  const clients = new Set(rows.map(r=>(r.numero.replace(/\D/g,'') || r.client.toUpperCase())).filter(Boolean));
+  const agents = new Set(rows.filter(r=>r.agent).map(r=>r.agent));
+  return {
+    n: rows.length,
+    validN: valid.length,
+    total,
+    avg: valid.length ? total/valid.length : null,
+    clients: clients.size,
+    agents: agents.size,
+    anomalies: rows.length - valid.length
+  };
+}
+
+function encGroup(rows, field){
+  const g = {};
+  rows.forEach(r=>{
+    const k = r[field] || 'Non renseigné';
+    if(!g[k]) g[k] = {n:0, validN:0, total:0};
+    g[k].n++;
+    if(!r.anomalie){ g[k].validN++; g[k].total += r.montant; }
+  });
+  return g;
+}
+
+function renderEncRecapTable(rows, field, label, tableId){
+  if(!rows.length) return `<div class="empty-state">Aucune donnée pour le récapitulatif.</div>`;
+  const g = encGroup(rows, field);
+  const keys = Object.keys(g).sort((a,b)=>g[b].total - g[a].total);
+  const st = encStats(rows);
+  const body = keys.map(k=>{
+    const x = g[k];
+    const part = st.total ? (x.total/st.total*100) : 0;
+    return `<tr><td>${escapeHtml(k)}</td><td>${x.n.toLocaleString('fr-FR')}</td><td>${fmtEuro(x.total)}</td><td>${part.toFixed(1)}%</td></tr>`;
+  }).join('');
+  const totalRow = `<tr style="font-weight:600;color:var(--text);"><td>Total</td><td>${st.n.toLocaleString('fr-FR')}</td><td>${fmtEuro(st.total)}</td><td>100.0%</td></tr>`;
+  return `<table${tableId ? ` id="${tableId}"` : ''}><thead><tr><th>${label}</th><th>Encaissements</th><th>Montant</th><th>Part du montant</th></tr></thead><tbody>${body}${totalRow}</tbody></table>`;
+}
+
+function renderEncWeeklyTable(rows, tableId){
+  const buckets = {};
+  rows.forEach(r=>{
+    const wk = weekKey(r.debut);
+    if(!buckets[wk]) buckets[wk] = {sortKey: weekSortKey(r.debut), rows:[]};
+    buckets[wk].rows.push(r);
+  });
+  const labels = Object.keys(buckets).sort((a,b)=>buckets[a].sortKey - buckets[b].sortKey);
+  if(!labels.length) return `<div class="empty-state">Aucune donnée datée pour construire le tableau hebdomadaire.</div>`;
+  const weekly = labels.map(l=>({label:l, st:encStats(buckets[l].rows)}));
+  const kpiRows = [
+    {label:'Encaissements',   get:w=>w.st.n.toLocaleString('fr-FR')},
+    {label:'Montant encaissé',get:w=>fmtEuro(w.st.total)},
+    {label:'Clients uniques', get:w=>w.st.clients.toLocaleString('fr-FR')},
+    {label:'Nbr Agent',       get:w=>w.st.agents.toLocaleString('fr-FR')}
+  ];
+  const head = weekly.map(w=>`<th>${escapeHtml(w.label)}</th>`).join('');
+  const body = kpiRows.map(kr=>{
+    const cells = weekly.map(w=>`<td>${kr.get(w)}</td>`).join('');
+    return `<tr><td style="font-family:'IBM Plex Sans',sans-serif;font-weight:500;color:var(--text);white-space:nowrap;">${kr.label}</td>${cells}</tr>`;
+  }).join('');
+  return `<table${tableId ? ` id="${tableId}"` : ''}><thead><tr><th>KPI</th>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function renderEncAgentTable(rows, tableId){
+  const withAgent = rows.filter(r=>r.agent);
+  if(!withAgent.length) return `<div class="empty-state">Aucun agent renseigné sur la période affichée.</div>`;
+  const groups = {};
+  withAgent.forEach(r=>{
+    if(!groups[r.agent]) groups[r.agent] = {rows:[], byMotif:{}};
+    const g = groups[r.agent];
+    g.rows.push(r);
+    if(!g.byMotif[r.motif]) g.byMotif[r.motif] = {n:0, total:0};
+    g.byMotif[r.motif].n++;
+    if(!r.anomalie) g.byMotif[r.motif].total += r.montant;
+  });
+  const stByAgent = {};
+  Object.keys(groups).forEach(a=>{ stByAgent[a] = encStats(groups[a].rows); });
+  const grandStats = encStats(withAgent);
+  const agentKeys = Object.keys(groups).sort((a,b)=>stByAgent[b].total - stByAgent[a].total);
+
+  const motifBreakdown = byMotif=>{
+    const entries = Object.keys(byMotif).sort((a,b)=>byMotif[b].n - byMotif[a].n);
+    return entries.map(m=>`${escapeHtml(m)} : ${byMotif[m].n.toLocaleString('fr-FR')} (${fmtEuro(byMotif[m].total)})`).join('<br>');
+  };
+  const buildRow = (label, st, byMotif)=>{
+    const part = grandStats.total ? (st.total/grandStats.total*100) : 0;
+    return `<td>${label}</td><td>${st.n.toLocaleString('fr-FR')}</td><td>${fmtEuro(st.total)}</td><td>${part.toFixed(1)}%</td><td>${st.clients.toLocaleString('fr-FR')}</td><td>${motifBreakdown(byMotif)}</td>`;
+  };
+
+  const body = agentKeys.map(a=>`<tr>${buildRow(escapeHtml(a), stByAgent[a], groups[a].byMotif)}</tr>`);
+  const totalByMotif = {};
+  withAgent.forEach(r=>{
+    if(!totalByMotif[r.motif]) totalByMotif[r.motif] = {n:0, total:0};
+    totalByMotif[r.motif].n++;
+    if(!r.anomalie) totalByMotif[r.motif].total += r.montant;
+  });
+  body.push(`<tr style="font-weight:600;color:var(--text);">${buildRow('Total', grandStats, totalByMotif)}</tr>`);
+
+  const head = `<th>Agent</th><th>Encaissements</th><th>Montant</th><th>Part du montant</th><th>Clients uniques</th><th>Encaissements par motif</th>`;
+  return `<table${tableId ? ` id="${tableId}"` : ''}><thead><tr>${head}</tr></thead><tbody>${body.join('')}</tbody></table>`;
+}
+
+function renderEncDoughnut(id, map){
+  destroyIfExists(id);
+  const el = document.getElementById(id);
+  if(!el) return;
+  const labels = Object.keys(map).sort((a,b)=>map[b]-map[a]);
+  const data = labels.map(l=>map[l]);
+  if(!data.reduce((a,b)=>a+b,0)){
+    el.parentElement.innerHTML = '<div class="empty-state">Aucun montant à afficher.</div>';
+    return;
+  }
+  const palette = ['#132440','#FFC72C','#2FBFB5','#1E4FA3','#8592A6','#7FD9D2','#C3CAD6','#C98A2E','#8E2A45'];
+  CHARTS[id] = new Chart(el.getContext('2d'), {
+    type:'doughnut',
+    data:{ labels, datasets:[{ data, backgroundColor: labels.map((_,i)=>palette[i%palette.length]), borderColor:'#FFFFFF', borderWidth:3 }] },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      cutout:'66%',
+      layout:{ padding:{top:22, bottom:22, left:70, right:70} },
+      plugins:{ legend:{display:false}, tooltip:{enabled:true, callbacks:{label:c=>`${c.label} : ${fmtEuro(c.parsed)}`}} }
+    },
+    plugins:[outerLabelsPlugin]
+  });
+}
+
+function renderEncaissement(key, rows, totalCount){
+  const total = totalCount === undefined ? rows.length : totalCount;
+  const statusText = total === rows.length
+    ? `${rows.length} lignes chargées · actualisé à ${new Date().toLocaleTimeString('fr-FR')}`
+    : `${rows.length} / ${total} lignes affichées (filtres actifs) · actualisé à ${new Date().toLocaleTimeString('fr-FR')}`;
+  document.getElementById(`status-${key}`).innerHTML = `<span class="dot ok"></span><span>${statusText}</span>`;
+
+  if(!rows.length){
+    document.getElementById(`content-${key}`).innerHTML = `<div class="empty-state">Aucun encaissement pour les filtres sélectionnés.</div>`;
+    return;
+  }
+
+  const st = encStats(rows);
+  const anomalieNote = st.anomalies
+    ? `<span style="color:var(--amber);">${st.anomalies} montant(s) aberrant(s) exclu(s)</span>`
+    : '';
+
+  const html = `
+    <div class="kpi-row" style="grid-template-columns:repeat(4,1fr);">
+      <div class="kpi"><div class="kpi-name">Montant encaissé</div><div class="val xl green">${fmtEuro(st.total)}</div><div class="label">Total des encaissements${anomalieNote ? '<br>'+anomalieNote : ''}</div></div>
+      <div class="kpi"><div class="kpi-name">Encaissements</div><div class="val cyan">${st.n.toLocaleString('fr-FR')}</div><div class="label">Nombre de paiements enregistrés</div></div>
+      <div class="kpi"><div class="kpi-name">Clients</div><div class="val">${st.clients.toLocaleString('fr-FR')}</div><div class="label">Clients uniques (par numéro)</div></div>
+      <div class="kpi"><div class="kpi-name">Agents</div><div class="val">${st.agents.toLocaleString('fr-FR')}</div><div class="label">Agents ayant encaissé</div></div>
+    </div>
+
+    <div class="grid-chart-recap">
+      <div class="panel">
+        <h3>Montant par motif</h3>
+        <div class="chart-wrap-type"><canvas id="chart-enc-motif"></canvas></div>
+      </div>
+      <div class="panel" style="overflow-x:auto;">
+        <div class="panel-head">
+          <h3>Récapitulatif par motif</h3>
+          <button class="dl-btn" type="button" onclick="downloadTableCSV('table-enc-motif','encaissement_recap_motif.csv')">${downloadIconSvg} Télécharger</button>
+        </div>
+        ${renderEncRecapTable(rows, 'motif', 'Motif', 'table-enc-motif')}
+      </div>
+    </div>
+
+    <div class="panel" style="margin-bottom:20px;overflow-x:auto;">
+      <div class="panel-head">
+        <h3>Récapitulatif par zone</h3>
+        <button class="dl-btn" type="button" onclick="downloadTableCSV('table-enc-zone','encaissement_recap_zone.csv')">${downloadIconSvg} Télécharger</button>
+      </div>
+      ${renderEncRecapTable(rows, 'zone', 'Zone', 'table-enc-zone')}
+    </div>
+
+    <div class="panel" style="margin-bottom:20px;overflow-x:auto;">
+      <div class="panel-head">
+        <h3>KPIs par semaine</h3>
+        <button class="dl-btn" type="button" onclick="downloadTableCSV('table-enc-weekly','encaissement_kpis_hebdomadaires.csv')">${downloadIconSvg} Télécharger</button>
+      </div>
+      ${renderEncWeeklyTable(rows, 'table-enc-weekly')}
+    </div>
+
+    <div class="panel" style="overflow-x:auto;">
+      <div class="panel-head">
+        <h3>Résumé des réalisations des agents</h3>
+        <button class="dl-btn" type="button" onclick="downloadTableCSV('table-enc-agents','encaissement_resume_agents.csv')">${downloadIconSvg} Télécharger</button>
+      </div>
+      <div class="table-scroll">
+        ${renderEncAgentTable(rows, 'table-enc-agents')}
+      </div>
+    </div>
+
+  `;
+  document.getElementById(`content-${key}`).innerHTML = html;
+
+  waitForChartLib().then(available=>{
+    if(!available){
+      ['chart-enc-motif'].forEach(id=>{
+        const el = document.getElementById(id);
+        if(el) el.parentElement.innerHTML = '<div class="empty-state">Bibliothèque de graphiques indisponible pour le moment (KPI et tableaux restent à jour).</div>';
+      });
+      return;
+    }
+    const sumBy = field=>{
+      const g = encGroup(rows, field), m = {};
+      Object.keys(g).forEach(k=>{ m[k] = Math.round(g[k].total*100)/100; });
+      return m;
+    };
+    try{ renderEncDoughnut('chart-enc-motif', sumBy('motif')); }catch(e){ console.error('enc motif chart', e); }
   });
 }
 
